@@ -3,6 +3,7 @@ import sys
 import re
 import logging
 import threading
+import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -13,7 +14,6 @@ from telegram.ext import (
     filters,
     ContextTypes
 )
-import easyocr
 from weasyprint import HTML
 
 # Configuración de Logs
@@ -22,11 +22,7 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# Inicializar EasyOCR (Español e Inglés, en CPU)
-print(">>> CARGANDO MODELO DE EASYOCR...", flush=True)
-reader = easyocr.Reader(['es', 'en'], gpu=False)
-
-# --- SERVIDOR HTTP DUMMY PARA RENDER (Mantiene el servicio activo) ---
+# --- SERVIDOR HTTP DUMMY PARA RENDER ---
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -40,30 +36,48 @@ def run_dummy_server():
 
 threading.Thread(target=run_dummy_server, daemon=True).start()
 
-# --- FUNCION EXTRAER MONTO CON EASYOCR ---
-def extraer_monto(ruta_imagen):
-    resultados = reader.readtext(ruta_imagen, detail=0)
-    texto_unido = " ".join(resultados)
-    print(f">>> TEXTO DETECTADO POR OCR: {texto_unido}", flush=True)
+# --- FUNCION EXTRAER MONTO CON API OCR (Ultraligera) ---
+def extraer_monto_ocr(ruta_imagen):
+    try:
+        # Usa la API gratuita de OCR.Space
+        url = 'https://api.ocr.space/parse/image'
+        with open(ruta_imagen, 'rb') as f:
+            response = requests.post(
+                url,
+                files={'filename': f},
+                data={'apikey': 'helloworld', 'language': 'spa', 'isOverlayRequired': False}
+            )
+        
+        result = response.json()
+        if not result.get('ParsedResults'):
+            return 0.0
 
-    # 1. Buscar coincidencias cerca de palabras clave
-    for linea in resultados:
-        if any(palabra in linea.lower() for palabra in ['total', 'importe', 'monto', 'pagar', 'suma', '$']):
-            numeros = re.findall(r'\d+(?:[.,]\d+)?', linea)
-            if numeros:
-                return float(numeros[-1].replace(',', '.'))
+        texto_unido = result['ParsedResults'][0]['ParsedText']
+        print(f">>> TEXTO DETECTADO POR OCR: {texto_unido}", flush=True)
 
-    # 2. Buscar patrones de importes decimales (.xx o ,xx)
-    montos = re.findall(r'\b\d+[.,]\d{2}\b', texto_unido)
-    if montos:
-        return float(montos[-1].replace(',', '.'))
+        lineas = texto_unido.split('\r\n')
 
-    # 3. Buscar el valor numérico más alto como último recurso
-    todos_los_numeros = re.findall(r'\b\d+(?:[.,]\d+)?\b', texto_unido)
-    if todos_los_numeros:
-        numeros_limpios = [float(n.replace(',', '.')) for n in todos_los_numeros if len(n) > 1]
-        if numeros_limpios:
-            return max(numeros_limpios)
+        # 1. Palabras clave
+        for linea in lineas:
+            if any(palabra in linea.lower() for palabra in ['total', 'importe', 'monto', 'pagar', 'suma', '$']):
+                numeros = re.findall(r'\d+(?:[.,]\d+)?', linea)
+                if numeros:
+                    return float(numeros[-1].replace(',', '.'))
+
+        # 2. Patrón de decimales
+        montos = re.findall(r'\b\d+[.,]\d{2}\b', texto_unido)
+        if montos:
+            return float(montos[-1].replace(',', '.'))
+
+        # 3. Número más alto
+        todos_los_numeros = re.findall(r'\b\d+(?:[.,]\d+)?\b', texto_unido)
+        if todos_los_numeros:
+            numeros_limpios = [float(n.replace(',', '.')) for n in todos_los_numeros if len(n) > 1]
+            if numeros_limpios:
+                return max(numeros_limpios)
+
+    except Exception as e:
+        print(f"❌ Error en llamada OCR: {e}", flush=True)
 
     return 0.0
 
@@ -78,25 +92,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def procesar_imagen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Analizando comprobante con OCR...")
     
-    # Descargar la foto enviada por el usuario
     foto = await update.message.photo[-1].get_file()
     ruta_local = "ticket_temp.jpg"
     await foto.download_to_drive(ruta_local)
 
-    # Procesar imagen
-    monto_detectado = extraer_monto(ruta_local)
+    monto_detectado = extraer_monto_ocr(ruta_local)
 
     if os.path.exists(ruta_local):
         os.remove(ruta_local)
 
-    # Inicializar lista si es el primer gasto
     if 'gastos' not in context.user_data:
         context.user_data['gastos'] = []
     
     context.user_data['gastos'].append(monto_detectado)
     total_acumulado = sum(context.user_data['gastos'])
     
-    # Botones de navegación interactiva
     keyboard = [
         [InlineKeyboardButton("➕ Cargar otro gasto", callback_data='cargar_otro')],
         [InlineKeyboardButton("📄 Cerrar viaje y generar PDF", callback_data='cerrar_viaje')]
@@ -130,7 +140,6 @@ async def manejar_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await query.edit_message_text("⏳ Generando el reporte PDF del viaje...")
 
-        # Generar vista HTML para WeasyPrint
         items_html = "".join([f"<li>Gasto #{i+1}: ${g:.2f}</li>" for i, g in enumerate(gastos)])
         html_content = f"""
         <html>
@@ -155,7 +164,6 @@ async def manejar_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pdf_path = "reporte_gastos.pdf"
         HTML(string=html_content).write_pdf(pdf_path)
 
-        # Enviar PDF generado
         with open(pdf_path, 'rb') as pdf_file:
             await context.bot.send_document(
                 chat_id=query.message.chat_id,
@@ -168,7 +176,6 @@ async def manejar_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if os.path.exists(pdf_path):
             os.remove(pdf_path)
 
-        # Limpiar la lista de gastos
         context.user_data['gastos'] = []
 
 # --- INICIALIZACIÓN DE LA APLICACIÓN ---
@@ -180,7 +187,6 @@ if __name__ == '__main__':
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Registro de Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO, procesar_imagen))
     app.add_handler(CallbackQueryHandler(manejar_botones))
