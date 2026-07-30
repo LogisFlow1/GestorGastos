@@ -185,11 +185,15 @@ if __name__ == '__main__':
         print("❌ ERROR: No se encontró TELEGRAM_TOKEN", flush=True)
         sys.exit(1)
 
+    # Construcción de la aplicación sin conflictos de callbacks
     app = ApplicationBuilder().token(TOKEN).build()
 
+    # Registro de Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO, procesar_imagen))
     app.add_handler(CallbackQueryHandler(manejar_botones))
 
     print(">>> BOT EN MARCHA Y ESCUCHANDO MENSAJES <<<", flush=True)
-    app.run_polling()
+    
+    # Parámetros explícitos para evitar fallos de polling en entornos sin TTY (Render)
+    app.run_polling(drop_pending_updates=True, stop_signals=None)
