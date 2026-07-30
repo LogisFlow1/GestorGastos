@@ -8,6 +8,7 @@ import base64
 import requests
 from io import BytesIO
 from PIL import Image
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -91,7 +92,6 @@ def extraer_monto_ocr(ruta_imagen):
 # --- HANDLERS DEL BOT DE TELEGRAM ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Inicializar datos de la sesión del viaje
     context.user_data['gastos'] = []
     context.user_data['titulo_viaje'] = "Rendición de Gastos"
     
@@ -112,14 +112,12 @@ async def recibir_titulo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def procesar_imagen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Analizando comprobante con OCR...")
     
-    # Descargar la foto del ticket
     foto = await update.message.photo[-1].get_file()
     ruta_local = f"ticket_temp_{update.message.chat_id}.jpg"
     await foto.download_to_drive(ruta_local)
 
-    # Convertir foto a Base64 para adjuntarla al reporte HTML/PDF
     with Image.open(ruta_local) as img:
-        img.thumbnail((800, 800))  # Optimizar tamaño para no inflar el PDF
+        img.thumbnail((800, 800))
         buffered = BytesIO()
         img.save(buffered, format="JPEG", quality=80)
         img_b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
@@ -129,11 +127,9 @@ async def procesar_imagen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if os.path.exists(ruta_local):
         os.remove(ruta_local)
 
-    # Guardar temporalmente el gasto actual para confirmación/edición
     context.user_data['monto_actual'] = monto_detectado
     context.user_data['foto_actual_b64'] = img_b64
 
-    # Mostrar menú de opciones
     keyboard = [
         [InlineKeyboardButton("✅ Confirmar monto", callback_data='confirmar_monto')],
         [InlineKeyboardButton("✏️ Editar monto manualmente", callback_data='editar_monto')]
@@ -165,8 +161,6 @@ async def guardar_monto_editado(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         nuevo_monto = float(re.sub(r'[^\d.]', '', texto_ingresado))
         context.user_data['monto_actual'] = nuevo_monto
-        
-        # Confirmar automáticamente y guardar el gasto
         return await guardar_gasto_en_lista(update, context)
     except ValueError:
         await update.message.reply_text("⚠️ Valor no válido. Por favor ingresa un número correcto (ejemplo: `1500.00`):")
@@ -181,7 +175,6 @@ async def guardar_gasto_en_lista(update: Update, context: ContextTypes.DEFAULT_T
     if 'gastos' not in context.user_data:
         context.user_data['gastos'] = []
 
-    # Guardar en la estructura del viaje
     monto = context.user_data.get('monto_actual', 0.0)
     foto_b64 = context.user_data.get('foto_actual_b64', '')
     
@@ -232,13 +225,11 @@ async def manejar_navegacion_botones(update: Update, context: ContextTypes.DEFAU
 
         await query.edit_message_text("⏳ Generando el reporte PDF con cuadro resumido y comprobantes...")
 
-        # Construcción de filas de la tabla de gastos
         filas_tabla = "".join([
             f"<tr><td>Gasto #{i+1}</td><td style='text-align: right;'>${g['monto']:.2f}</td></tr>"
             for i, g in enumerate(gastos)
         ])
 
-        # Construcción de la galería de fotos
         galeria_fotos = "".join([
             f"""
             <div class="comprobante-box">
@@ -249,7 +240,6 @@ async def manejar_navegacion_botones(update: Update, context: ContextTypes.DEFAU
             for i, g in enumerate(gastos) if g['foto_b64']
         ])
 
-        # Plantilla HTML/CSS para WeasyPrint
         html_content = f"""
         <html>
         <head>
@@ -297,7 +287,6 @@ async def manejar_navegacion_botones(update: Update, context: ContextTypes.DEFAU
         pdf_path = f"reporte_{query.message.chat_id}.pdf"
         HTML(string=html_content).write_pdf(pdf_path)
 
-        # Enviar documento PDF al usuario
         with open(pdf_path, 'rb') as pdf_file:
             await context.bot.send_document(
                 chat_id=query.message.chat_id,
@@ -320,13 +309,11 @@ if __name__ == '__main__':
         print("❌ ERROR: No se encontró TELEGRAM_TOKEN", flush=True)
         sys.exit(1)
 
-    # Event Loop explícito para Python 3.14+ en Render
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Flujo conversacional
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
