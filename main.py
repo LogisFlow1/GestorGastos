@@ -1,4 +1,24 @@
 import os
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# Servidor web ficticio para engañar al Web Service de Render
+class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot activo")
+
+def run_dummy_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(('0.0.0.0', port), SimpleHTTPRequestHandler)
+    server.serve_forever()
+
+# Iniciar el servidor web en segundo plano antes del bot
+threading.Thread(target=run_dummy_server, daemon=True).start()
+
+# --- AQUÍ SIGUE TU CÓDIGO HABITUAL DEL BOT ---
+import os
 import re
 import datetime
 from PIL import Image
