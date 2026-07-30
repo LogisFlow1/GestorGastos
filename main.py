@@ -3,6 +3,7 @@ import sys
 import re
 import logging
 import threading
+import asyncio
 import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -39,7 +40,6 @@ threading.Thread(target=run_dummy_server, daemon=True).start()
 # --- FUNCION EXTRAER MONTO CON API OCR (Ultraligera) ---
 def extraer_monto_ocr(ruta_imagen):
     try:
-        # Usa la API gratuita de OCR.Space
         url = 'https://api.ocr.space/parse/image'
         with open(ruta_imagen, 'rb') as f:
             response = requests.post(
@@ -178,22 +178,22 @@ async def manejar_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         context.user_data['gastos'] = []
 
-# --- INICIALIZACIÓN DE LA APLICACIÓN ---
+# --- INICIALIZACIÓN COMPATIBLE CON PYTHON 3.14+ ---
 if __name__ == '__main__':
     TOKEN = os.environ.get("TELEGRAM_TOKEN")
     if not TOKEN:
         print("❌ ERROR: No se encontró TELEGRAM_TOKEN", flush=True)
         sys.exit(1)
 
-    # Construcción de la aplicación sin conflictos de callbacks
+    # Crear e instanciar el event loop explícitamente para Python 3.14
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Registro de Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO, procesar_imagen))
     app.add_handler(CallbackQueryHandler(manejar_botones))
 
     print(">>> BOT EN MARCHA Y ESCUCHANDO MENSAJES <<<", flush=True)
-    
-    # Parámetros explícitos para evitar fallos de polling en entornos sin TTY (Render)
-    app.run_polling(drop_pending_updates=True, stop_signals=None)
+    app.run_polling(drop_pending_updates=True)
