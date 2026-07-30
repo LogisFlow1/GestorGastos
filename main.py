@@ -45,7 +45,7 @@ def run_dummy_server():
 
 threading.Thread(target=run_dummy_server, daemon=True).start()
 
-# --- FUNCION EXTRAER MONTO CON API OCR (Ultraligera) ---
+# --- FUNCION EXTRAER MONTO CON API OCR (Con Timeouts) ---
 def extraer_monto_ocr(ruta_imagen):
     try:
         url = 'https://api.ocr.space/parse/image'
@@ -53,7 +53,8 @@ def extraer_monto_ocr(ruta_imagen):
             response = requests.post(
                 url,
                 files={'filename': f},
-                data={'apikey': 'helloworld', 'language': 'spa', 'isOverlayRequired': False}
+                data={'apikey': 'helloworld', 'language': 'spa', 'isOverlayRequired': False},
+                timeout=15  # Evita que la llamada se cuelgue si la API demora
             )
         
         result = response.json()
@@ -85,7 +86,7 @@ def extraer_monto_ocr(ruta_imagen):
                 return max(numeros_limpios)
 
     except Exception as e:
-        print(f"❌ Error en llamada OCR: {e}", flush=True)
+        print(f"❌ Error o Timeout en llamada OCR: {e}", flush=True)
 
     return 0.0
 
@@ -110,22 +111,30 @@ async def recibir_titulo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ESPERANDO_FOTO
 
 async def procesar_imagen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Analizando comprobante con OCR...")
+    msg_espera = await update.message.reply_text("🔍 Analizando comprobante...")
     
-    foto = await update.message.photo[-1].get_file()
     ruta_local = f"ticket_temp_{update.message.chat_id}.jpg"
-    await foto.download_to_drive(ruta_local)
+    try:
+        foto = await update.message.photo[-1].get_file()
+        await foto.download_to_drive(ruta_local)
 
-    with Image.open(ruta_local) as img:
-        img.thumbnail((800, 800))
-        buffered = BytesIO()
-        img.save(buffered, format="JPEG", quality=80)
-        img_b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+        # Compresión ligera para cuidar la memoria RAM en Render
+        with Image.open(ruta_local) as img:
+            img = img.convert('RGB')
+            img.thumbnail((600, 600))  # Tamaño optimizado
+            buffered = BytesIO()
+            img.save(buffered, format="JPEG", quality=65)
+            img_b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
 
-    monto_detectado = extraer_monto_ocr(ruta_local)
+        monto_detectado = extraer_monto_ocr(ruta_local)
 
-    if os.path.exists(ruta_local):
-        os.remove(ruta_local)
+    except Exception as e:
+        print(f"❌ Error procesando la imagen: {e}", flush=True)
+        await update.message.reply_text("⚠️ Ocurrió un inconveniente procesando la imagen. Por favor, reenvíala o escribe `/start` para reiniciar.")
+        return ESPERANDO_FOTO
+    finally:
+        if os.path.exists(ruta_local):
+            os.remove(ruta_local)
 
     context.user_data['monto_actual'] = monto_detectado
     context.user_data['foto_actual_b64'] = img_b64
@@ -241,9 +250,8 @@ async def manejar_navegacion_botones(update: Update, context: ContextTypes.DEFAU
         titulo = context.user_data.get('titulo_viaje', 'Rendición de Gastos')
         total = sum(g['monto'] for g in gastos)
 
-        await query.edit_message_text("⏳ Generando el reporte PDF con cuadro resumido y comprobantes...")
+        await query.edit_message_text("⏳ Generando el reporte PDF...")
 
-        # Construcción de filas de la tabla con descripción
         filas_tabla = "".join([
             f"<tr>"
             f"<td>Gasto #{i+1}</td>"
@@ -253,7 +261,6 @@ async def manejar_navegacion_botones(update: Update, context: ContextTypes.DEFAU
             for i, g in enumerate(gastos)
         ])
 
-        # Galería de comprobantes con sus descripciones
         galeria_fotos = "".join([
             f"""
             <div class="comprobante-box">
@@ -277,7 +284,7 @@ async def manejar_navegacion_botones(update: Update, context: ContextTypes.DEFAU
                 .total-row {{ font-size: 18px; font-weight: bold; background-color: #e8f5e9; color: #2e7d32; }}
                 .page-break {{ page-break-before: always; }}
                 .comprobante-box {{ margin-bottom: 30px; text-align: center; border: 1px solid #ddd; padding: 10px; border-radius: 5px; }}
-                .ticket-img {{ max-width: 90%; max-height: 500px; height: auto; border-radius: 3px; }}
+                .ticket-img {{ max-width: 90%; max-height: 450px; height: auto; border-radius: 3px; }}
             </style>
         </head>
         <body>
@@ -310,19 +317,23 @@ async def manejar_navegacion_botones(update: Update, context: ContextTypes.DEFAU
         """
 
         pdf_path = f"reporte_{query.message.chat_id}.pdf"
-        HTML(string=html_content).write_pdf(pdf_path)
+        try:
+            HTML(string=html_content).write_pdf(pdf_path)
 
-        with open(pdf_path, 'rb') as pdf_file:
-            await context.bot.send_document(
-                chat_id=query.message.chat_id,
-                document=pdf_file,
-                filename=f"Reporte_{titulo.replace(' ', '_')}.pdf",
-                caption=f"📄 **Viaje Finalizado: {titulo}**\nTotal acumulado: **${total:.2f}**\n\nSi deseas iniciar otro viaje, envía `/start`.",
-                parse_mode='Markdown'
-            )
-
-        if os.path.exists(pdf_path):
-            os.remove(pdf_path)
+            with open(pdf_path, 'rb') as pdf_file:
+                await context.bot.send_document(
+                    chat_id=query.message.chat_id,
+                    document=pdf_file,
+                    filename=f"Reporte_{titulo.replace(' ', '_')}.pdf",
+                    caption=f"📄 **Viaje Finalizado: {titulo}**\nTotal acumulado: **${total:.2f}**\n\nSi deseas iniciar otro viaje, envía `/start`.",
+                    parse_mode='Markdown'
+                )
+        except Exception as e:
+            print(f"❌ Error generando PDF: {e}", flush=True)
+            await query.message.reply_text("⚠️ Error al generar el archivo PDF. Intenta de nuevo con `/start`.")
+        finally:
+            if os.path.exists(pdf_path):
+                os.remove(pdf_path)
 
         context.user_data.clear()
         return ConversationHandler.END
@@ -358,4 +369,11 @@ if __name__ == '__main__':
     app.add_handler(conv_handler)
 
     print(">>> BOT EN MARCHA Y ESCUCHANDO MENSAJES <<<", flush=True)
-    app.run_polling(drop_pending_updates=True)
+    
+    # Parámetros optimizados para evitar desconexiones en entornos Cloud
+    app.run_polling(
+        drop_pending_updates=True,
+        read_timeout=30,
+        write_timeout=30,
+        connect_timeout=30
+    )
