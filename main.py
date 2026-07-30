@@ -29,7 +29,7 @@ logging.basicConfig(
 )
 
 # --- ESTADOS DE LA CONVERSACIÓN ---
-TITULO_VIAJE, ESPERANDO_FOTO, EDITANDO_MONTO = range(3)
+TITULO_VIAJE, ESPERANDO_FOTO, EDITANDO_MONTO, INGRESANDO_DESCRIPCION = range(4)
 
 # --- SERVIDOR HTTP DUMMY PARA RENDER ---
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
@@ -161,25 +161,46 @@ async def guardar_monto_editado(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         nuevo_monto = float(re.sub(r'[^\d.]', '', texto_ingresado))
         context.user_data['monto_actual'] = nuevo_monto
-        return await guardar_gasto_en_lista(update, context)
+        
+        await update.message.reply_text(
+            f"👍 Monto fijado en: `${nuevo_monto:.2f}`\n\n"
+            "📝 Ahora, escribe una breve **descripción** de este gasto (ejemplo: *Cena de equipo*, *Estacionamiento*, *Combustible*):",
+            parse_mode='Markdown'
+        )
+        return INGRESANDO_DESCRIPCION
     except ValueError:
         await update.message.reply_text("⚠️ Valor no válido. Por favor ingresa un número correcto (ejemplo: `1500.00`):")
         return EDITANDO_MONTO
 
-async def confirmar_gasto_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def confirmar_monto_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    return await guardar_gasto_en_lista(update, context, query=query)
+    
+    monto = context.user_data.get('monto_actual', 0.0)
+    await query.edit_message_text(
+        f"✅ Monto confirmado: `${monto:.2f}`\n\n"
+        "📝 Ahora, escribe una breve **descripción** de este gasto (ejemplo: *Almuerzo*, *Taxi al aeropuerto*, *Hotel*):",
+        parse_mode='Markdown'
+    )
+    return INGRESANDO_DESCRIPCION
 
-async def guardar_gasto_en_lista(update: Update, context: ContextTypes.DEFAULT_TYPE, query=None):
+async def recibir_descripcion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    descripcion = update.message.text
+    context.user_data['descripcion_actual'] = descripcion
+
+    return await guardar_gasto_en_lista(update, context)
+
+async def guardar_gasto_en_lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'gastos' not in context.user_data:
         context.user_data['gastos'] = []
 
     monto = context.user_data.get('monto_actual', 0.0)
     foto_b64 = context.user_data.get('foto_actual_b64', '')
+    descripcion = context.user_data.get('descripcion_actual', 'Gasto sin descripción')
     
     context.user_data['gastos'].append({
         'monto': monto,
+        'descripcion': descripcion,
         'foto_b64': foto_b64
     })
 
@@ -192,16 +213,13 @@ async def guardar_gasto_en_lista(update: Update, context: ContextTypes.DEFAULT_T
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     mensaje = (
-        f"💰 **Gasto guardado:** ${monto:.2f}\n"
+        f"📌 **Gasto guardado:** {descripcion}\n"
+        f"💰 **Monto:** ${monto:.2f}\n"
         f"📊 **Total acumulado en {context.user_data.get('titulo_viaje', 'este viaje')}:** `${total_acumulado:.2f}`\n\n"
         "¿Qué deseas hacer a continuación?"
     )
 
-    if query:
-        await query.edit_message_text(mensaje, reply_markup=reply_markup, parse_mode='Markdown')
-    else:
-        await update.message.reply_text(mensaje, reply_markup=reply_markup, parse_mode='Markdown')
-
+    await update.message.reply_text(mensaje, reply_markup=reply_markup, parse_mode='Markdown')
     return ESPERANDO_FOTO
 
 async def manejar_navegacion_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -225,15 +243,21 @@ async def manejar_navegacion_botones(update: Update, context: ContextTypes.DEFAU
 
         await query.edit_message_text("⏳ Generando el reporte PDF con cuadro resumido y comprobantes...")
 
+        # Construcción de filas de la tabla con descripción
         filas_tabla = "".join([
-            f"<tr><td>Gasto #{i+1}</td><td style='text-align: right;'>${g['monto']:.2f}</td></tr>"
+            f"<tr>"
+            f"<td>Gasto #{i+1}</td>"
+            f"<td>{g['descripcion']}</td>"
+            f"<td style='text-align: right;'>${g['monto']:.2f}</td>"
+            f"</tr>"
             for i, g in enumerate(gastos)
         ])
 
+        # Galería de comprobantes con sus descripciones
         galeria_fotos = "".join([
             f"""
             <div class="comprobante-box">
-                <h4>Comprobante #{i+1} - Monto: ${g['monto']:.2f}</h4>
+                <h4>Comprobante #{i+1}: {g['descripcion']} - Monto: ${g['monto']:.2f}</h4>
                 <img src="data:image/jpeg;base64,{g['foto_b64']}" class="ticket-img"/>
             </div>
             """
@@ -263,14 +287,15 @@ async def manejar_navegacion_botones(update: Update, context: ContextTypes.DEFAU
             <table>
                 <thead>
                     <tr>
-                        <th>Concepto</th>
+                        <th>Item</th>
+                        <th>Descripción</th>
                         <th style="text-align: right;">Monto</th>
                     </tr>
                 </thead>
                 <tbody>
                     {filas_tabla}
                     <tr class="total-row">
-                        <td>TOTAL GENERAL</td>
+                        <td colspan="2">TOTAL GENERAL</td>
                         <td style="text-align: right;">${total:.2f}</td>
                     </tr>
                 </tbody>
@@ -321,10 +346,11 @@ if __name__ == '__main__':
             ESPERANDO_FOTO: [
                 MessageHandler(filters.PHOTO, procesar_imagen),
                 CallbackQueryHandler(solicitar_edicion_monto, pattern='^editar_monto$'),
-                CallbackQueryHandler(confirmar_gasto_callback, pattern='^confirmar_monto$'),
+                CallbackQueryHandler(confirmar_monto_callback, pattern='^confirmar_monto$'),
                 CallbackQueryHandler(manejar_navegacion_botones, pattern='^(cargar_otro|cerrar_viaje)$')
             ],
-            EDITANDO_MONTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, guardar_monto_editado)]
+            EDITANDO_MONTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, guardar_monto_editado)],
+            INGRESANDO_DESCRIPCION: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_descripcion)]
         },
         fallbacks=[CommandHandler("start", start)]
     )
