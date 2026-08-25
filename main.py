@@ -15,7 +15,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 
-# NUEVAS IMPORTACIONES: Herramientas para dibujar el Gráfico de Torta
+# Herramientas para dibujar el Gráfico de Torta
 from reportlab.graphics.shapes import Drawing
 from reportlab.graphics.charts.piecharts import Pie
 
@@ -241,7 +241,6 @@ async def procesar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         txt = update.message.text
         
-        # 1. ¿Está esperando un nuevo monto?
         if 'esperando_monto' in context.user_data:
             gasto_id = context.user_data['esperando_monto']
             try:
@@ -257,11 +256,9 @@ async def procesar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ Formato incorrecto. Escribe solo el número (Ej: 2500):")
             return
 
-        # 2. Reaccionar a botones fijos
         if txt == "📊 Ver Gastos": return await accion_ver_gastos(update, context)
         if txt == "🏁 Cerrar Viaje": return await accion_cerrar_viaje(update, context)
 
-        # 3. MODO INTUITIVO: Si escribe algo y NO tiene viaje, es el DESTINO.
         user_id = update.effective_user.id
         viaje = get_viaje_activo(user_id)
         
@@ -287,7 +284,7 @@ async def procesar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error procesando texto: {e}")
         await update.message.reply_text(f"❌ Hubo un error de procesamiento. Intenta de nuevo.")
 
-# --- REPORTE FINAL CON GRAFICO DE TORTA ---
+# --- REPORTE FINAL CON GRÁFICO DE TORTA Y TABLA MEJORADA ---
 async def accion_cerrar_viaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user_id = update.effective_user.id
@@ -299,7 +296,6 @@ async def accion_cerrar_viaje(update: Update, context: ContextTypes.DEFAULT_TYPE
         conn = sqlite3.connect("gastos.db")
         cursor = conn.cursor()
         
-        # Al no usar 'ORDER BY', SQLite devuelve los datos en orden de creación (ID)
         cursor.execute("SELECT id, monto, categoria, descripcion, foto_path, fecha FROM gastos WHERE viaje_id = ?", (viaje_id,))
         gastos = cursor.fetchall()
 
@@ -310,47 +306,90 @@ async def accion_cerrar_viaje(update: Update, context: ContextTypes.DEFAULT_TYPE
         pdf_filename = f"Reporte_Viaje_{viaje_id}.pdf"
         doc = SimpleDocTemplate(pdf_filename, pagesize=letter, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36)
         styles = getSampleStyleSheet()
-        story = [Paragraph("<b>Reporte de Rendición de Gastos</b>", styles['Title']), Paragraph(f"<b>Destino:</b> {destino} | <b>Fecha:</b> {fecha_inicio}", styles['Normal']), Spacer(1, 15)]
+        
+        # Estilos personalizados para darle un toque más limpio
+        estilo_titulo = ParagraphStyle('TituloPrincipal', parent=styles['Title'], textColor=colors.HexColor("#1A365D"), fontSize=18, spaceAfter=15)
+        estilo_sub = ParagraphStyle('Subtitulo', parent=styles['Normal'], fontSize=12, spaceAfter=20, textColor=colors.HexColor("#333333"))
+        
+        story = [
+            Paragraph("<b>Reporte de Rendición de Gastos</b>", estilo_titulo), 
+            Paragraph(f"<b>Destino:</b> {destino} &nbsp;&nbsp;&nbsp; | &nbsp;&nbsp;&nbsp; <b>Fecha:</b> {fecha_inicio}", estilo_sub)
+        ]
 
-        # --- 1. TABLA EN ORDEN CRONOLÓGICO ---
+        # --- 1. TABLA EN ORDEN CRONOLÓGICO CON FORMATO PROFESIONAL ---
         tabla_data = [["ID", "Fecha", "Categoría", "Descripción", "Monto ($)"]]
         total_monto = 0.0
-        
-        # Variables para calcular porcentajes del gráfico
         totales_categoria = {"Transporte": 0.0, "Comida": 0.0, "Otro": 0.0}
 
-        for g in gastos:
-            # Llenamos la tabla fila por fila (orden de carga)
-            tabla_data.append([str(g[0]), g[5], g[2], g[3], f"${g[1]:.2f}"])
-            total_monto += g[1]
-            
-            # Sumamos al total de la categoría para el gráfico
-            cat = g[2]
-            if cat in totales_categoria:
-                totales_categoria[cat] += g[1]
-            else:
-                totales_categoria["Otro"] += g[1]
+        estilos_tabla = [
+            ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#1A365D")),
+            ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
+            ('ALIGN', (0,0), (-1,0), 'CENTER'),
+            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+            ('BOTTOMPADDING', (0,0), (-1,0), 10),
+            ('TOPPADDING', (0,0), (-1,0), 10),
+            ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),
+            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ]
 
-        tabla_data.append(["", "", "", "<b>TOTAL:</b>", f"<b>${total_monto:.2f}</b>"])
-        t = Table(tabla_data, colWidths=[30, 80, 80, 240, 100])
-        t.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,0), colors.HexColor("#1A365D")), ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke), ('ALIGN', (0,0), (-1,-1), 'LEFT'), ('GRID', (0,0), (-1,-1), 0.5, colors.grey)]))
+        agrupados = {"Transporte": [], "Comida": [], "Otro": []}
+        for g in gastos: agrupados[g[2] if g[2] in agrupados else "Otro"].append(g)
+
+        row_idx = 1
+        for cat in ["Transporte", "Comida", "Otro"]:
+            if agrupados[cat]:
+                # Estructuramos la fila separadora usando TableStyle (Sin código HTML expuesto)
+                tabla_data.append(["", "", f"--- {cat.upper()} ---", "", ""])
+                estilos_tabla.extend([
+                    ('SPAN', (0, row_idx), (-1, row_idx)),
+                    ('BACKGROUND', (0, row_idx), (-1, row_idx), colors.HexColor("#F4F4F6")),
+                    ('FONTNAME', (0, row_idx), (-1, row_idx), 'Helvetica-Bold'),
+                    ('ALIGN', (0, row_idx), (-1, row_idx), 'CENTER'),
+                    ('TEXTCOLOR', (0, row_idx), (-1, row_idx), colors.HexColor("#555555")),
+                    ('BOTTOMPADDING', (0, row_idx), (-1, row_idx), 6),
+                    ('TOPPADDING', (0, row_idx), (-1, row_idx), 6)
+                ])
+                row_idx += 1
+                
+                for g in agrupados[cat]:
+                    tabla_data.append([str(g[0]), g[5], g[2], g[3], f"${g[1]:.2f}"])
+                    estilos_tabla.extend([
+                        ('ALIGN', (0, row_idx), (0, row_idx), 'CENTER'),
+                        ('ALIGN', (4, row_idx), (4, row_idx), 'RIGHT')
+                    ])
+                    total_monto += g[1]
+                    totales_categoria[cat] += g[1]
+                    row_idx += 1
+
+        # Cierre de la Tabla (Total) utilizando estilos nativos
+        tabla_data.append(["", "", "", "TOTAL:", f"${total_monto:.2f}"])
+        estilos_tabla.extend([
+            ('FONTNAME', (3, row_idx), (4, row_idx), 'Helvetica-Bold'),
+            ('TEXTCOLOR', (3, row_idx), (4, row_idx), colors.HexColor("#1A365D")),
+            ('ALIGN', (3, row_idx), (4, row_idx), 'RIGHT'),
+            ('LINEABOVE', (0, row_idx), (-1, row_idx), 1.5, colors.HexColor("#1A365D")),
+            ('TOPPADDING', (0, row_idx), (-1, row_idx), 8),
+        ])
+
+        t = Table(tabla_data, colWidths=[30, 80, 80, 240, 90])
+        t.setStyle(TableStyle(estilos_tabla))
         story.append(t)
-        story.append(Spacer(1, 20))
+        story.append(Spacer(1, 25))
 
         # --- 2. GRÁFICO DE TORTA ---
         if total_monto > 0:
-            story.append(Paragraph("<b>Distribución de Gastos</b>", styles['Heading2']))
+            story.append(Paragraph("<b>Distribución de Gastos</b>", ParagraphStyle('H2', parent=styles['Heading2'], textColor=colors.HexColor("#1A365D"))))
             story.append(Spacer(1, 10))
             
             datos_grafico = []
             etiquetas_grafico = []
             colores_grafico = []
             
-            # Asignamos colores bonitos a cada categoría
+            # Asignamos colores a cada categoría (Estilo corporativo/pastel)
             mapa_colores = {
-                "Transporte": colors.HexColor("#FF9999"), # Rojo pastel
-                "Comida": colors.HexColor("#99CCFF"),     # Azul pastel
-                "Otro": colors.HexColor("#99FF99")        # Verde pastel
+                "Transporte": colors.HexColor("#FF9999"), 
+                "Comida": colors.HexColor("#99CCFF"),     
+                "Otro": colors.HexColor("#99FF99")        
             }
 
             for cat, suma in totales_categoria.items():
@@ -360,7 +399,7 @@ async def accion_cerrar_viaje(update: Update, context: ContextTypes.DEFAULT_TYPE
                     etiquetas_grafico.append(f"{cat} ({porcentaje:.1f}%)")
                     colores_grafico.append(mapa_colores[cat])
 
-            # Dibujamos la torta
+            # Dimensiones del gráfico de pastel
             d = Drawing(400, 160)
             pc = Pie()
             pc.x = 125
@@ -370,7 +409,6 @@ async def accion_cerrar_viaje(update: Update, context: ContextTypes.DEFAULT_TYPE
             pc.data = datos_grafico
             pc.labels = etiquetas_grafico
             
-            # Pintamos cada porción con los colores pastel
             for i, color in enumerate(colores_grafico):
                 pc.slices[i].fillColor = color
                 pc.slices[i].strokeColor = colors.white
@@ -379,23 +417,29 @@ async def accion_cerrar_viaje(update: Update, context: ContextTypes.DEFAULT_TYPE
             d.add(pc)
             story.append(d)
         
-        # --- 3. ANEXO DE FOTOS (CUADRÍCULA 2x2) ---
+        # --- 3. ANEXO DE FOTOS ---
         story.append(PageBreak())
-        story.append(Paragraph("<b>Anexo de Comprobantes</b>", styles['Heading2']))
+        story.append(Paragraph("<b>Anexo de Comprobantes</b>", ParagraphStyle('H2', parent=styles['Heading2'], textColor=colors.HexColor("#1A365D"))))
+        story.append(Spacer(1, 10))
+        
         cajas_fotos = []
         for g in gastos:
             if g[4] and os.path.exists(g[4]):
                 try: 
                     cajas_fotos.append([
                         RLImage(g[4], width=240, height=260), 
-                        Paragraph(f"<b>[ID {g[0]}]</b> {g[2]} - ${g[1]:.2f}<br/>{g[3][:35]}", ParagraphStyle('Img', fontSize=8, alignment=1))
+                        Paragraph(f"<b>[ID {g[0]}]</b> {g[2]} - ${g[1]:.2f}<br/>{g[3][:35]}", ParagraphStyle('Img', fontSize=9, alignment=1, spaceBefore=5))
                     ])
                 except: pass
 
         filas = [cajas_fotos[i:i+2] if len(cajas_fotos[i:i+2])==2 else [cajas_fotos[i], ""] for i in range(0, len(cajas_fotos), 2)]
         if filas:
             gt = Table(filas, colWidths=[270, 270])
-            gt.setStyle(TableStyle([('ALIGN', (0,0), (-1,-1), 'CENTER')]))
+            gt.setStyle(TableStyle([
+                ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+                ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+                ('BOTTOMPADDING', (0,0), (-1,-1), 15)
+            ]))
             story.append(gt)
 
         doc.build(story)
@@ -435,11 +479,9 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.Regex(r'(?i)^(hola|buenas|buen dia)'), saludar_usuario))
     
     app.add_handler(MessageHandler(filters.PHOTO, procesar_foto))
-    
-    # Filtro inteligente de texto
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_texto))
     
-    # Callbacks de los botones
+    # Callbacks
     app.add_handler(CallbackQueryHandler(boton_categoria, pattern='^cat_'))
     app.add_handler(CallbackQueryHandler(callback_gestionar_lista, pattern='^gestionar_lista$'))
     app.add_handler(CallbackQueryHandler(callback_opciones_gasto, pattern='^opciones_'))
