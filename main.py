@@ -9,10 +9,15 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Herramientas para el PDF
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage, PageBreak
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
+
+# NUEVAS IMPORTACIONES: Herramientas para dibujar el Gráfico de Torta
+from reportlab.graphics.shapes import Drawing
+from reportlab.graphics.charts.piecharts import Pie
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
@@ -37,7 +42,6 @@ def get_viaje_activo(user_id):
 
 # --- TECLADO FIJO INFERIOR ---
 def menu_teclado():
-    # Eliminamos el persistent=True que causaba el conflicto
     keyboard = [[KeyboardButton("📊 Ver Gastos"), KeyboardButton("🏁 Cerrar Viaje")]]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -283,17 +287,19 @@ async def procesar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error procesando texto: {e}")
         await update.message.reply_text(f"❌ Hubo un error de procesamiento. Intenta de nuevo.")
 
-# --- REPORTE FINAL ---
+# --- REPORTE FINAL CON GRAFICO DE TORTA ---
 async def accion_cerrar_viaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user_id = update.effective_user.id
         viaje = get_viaje_activo(user_id)
         if not viaje: return await update.message.reply_text("No tienes ningún viaje activo.")
         
-        await update.message.reply_text("Generando tu PDF agrupado, un momento... ⏳")
+        await update.message.reply_text("Generando tu PDF con gráfico, un momento... ⏳")
         viaje_id, destino, fecha_inicio = viaje
         conn = sqlite3.connect("gastos.db")
         cursor = conn.cursor()
+        
+        # Al no usar 'ORDER BY', SQLite devuelve los datos en orden de creación (ID)
         cursor.execute("SELECT id, monto, categoria, descripcion, foto_path, fecha FROM gastos WHERE viaje_id = ?", (viaje_id,))
         gastos = cursor.fetchall()
 
@@ -306,30 +312,84 @@ async def accion_cerrar_viaje(update: Update, context: ContextTypes.DEFAULT_TYPE
         styles = getSampleStyleSheet()
         story = [Paragraph("<b>Reporte de Rendición de Gastos</b>", styles['Title']), Paragraph(f"<b>Destino:</b> {destino} | <b>Fecha:</b> {fecha_inicio}", styles['Normal']), Spacer(1, 15)]
 
+        # --- 1. TABLA EN ORDEN CRONOLÓGICO ---
         tabla_data = [["ID", "Fecha", "Categoría", "Descripción", "Monto ($)"]]
         total_monto = 0.0
+        
+        # Variables para calcular porcentajes del gráfico
+        totales_categoria = {"Transporte": 0.0, "Comida": 0.0, "Otro": 0.0}
 
-        agrupados = {"Transporte": [], "Comida": [], "Otro": []}
-        for g in gastos: agrupados[g[2] if g[2] in agrupados else "Otro"].append(g)
-
-        for cat in ["Transporte", "Comida", "Otro"]:
-            if agrupados[cat]:
-                tabla_data.append(["", "", f"--- {cat.upper()} ---", "", ""])
-                for g in agrupados[cat]:
-                    tabla_data.append([str(g[0]), g[5], g[2], g[3], f"${g[1]:.2f}"])
-                    total_monto += g[1]
+        for g in gastos:
+            # Llenamos la tabla fila por fila (orden de carga)
+            tabla_data.append([str(g[0]), g[5], g[2], g[3], f"${g[1]:.2f}"])
+            total_monto += g[1]
+            
+            # Sumamos al total de la categoría para el gráfico
+            cat = g[2]
+            if cat in totales_categoria:
+                totales_categoria[cat] += g[1]
+            else:
+                totales_categoria["Otro"] += g[1]
 
         tabla_data.append(["", "", "", "<b>TOTAL:</b>", f"<b>${total_monto:.2f}</b>"])
         t = Table(tabla_data, colWidths=[30, 80, 80, 240, 100])
         t.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,0), colors.HexColor("#1A365D")), ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke), ('ALIGN', (0,0), (-1,-1), 'LEFT'), ('GRID', (0,0), (-1,-1), 0.5, colors.grey)]))
         story.append(t)
+        story.append(Spacer(1, 20))
+
+        # --- 2. GRÁFICO DE TORTA ---
+        if total_monto > 0:
+            story.append(Paragraph("<b>Distribución de Gastos</b>", styles['Heading2']))
+            story.append(Spacer(1, 10))
+            
+            datos_grafico = []
+            etiquetas_grafico = []
+            colores_grafico = []
+            
+            # Asignamos colores bonitos a cada categoría
+            mapa_colores = {
+                "Transporte": colors.HexColor("#FF9999"), # Rojo pastel
+                "Comida": colors.HexColor("#99CCFF"),     # Azul pastel
+                "Otro": colors.HexColor("#99FF99")        # Verde pastel
+            }
+
+            for cat, suma in totales_categoria.items():
+                if suma > 0:
+                    porcentaje = (suma / total_monto) * 100
+                    datos_grafico.append(suma)
+                    etiquetas_grafico.append(f"{cat} ({porcentaje:.1f}%)")
+                    colores_grafico.append(mapa_colores[cat])
+
+            # Dibujamos la torta
+            d = Drawing(400, 160)
+            pc = Pie()
+            pc.x = 125
+            pc.y = 10
+            pc.width = 140
+            pc.height = 140
+            pc.data = datos_grafico
+            pc.labels = etiquetas_grafico
+            
+            # Pintamos cada porción con los colores pastel
+            for i, color in enumerate(colores_grafico):
+                pc.slices[i].fillColor = color
+                pc.slices[i].strokeColor = colors.white
+                pc.slices[i].strokeWidth = 1
+            
+            d.add(pc)
+            story.append(d)
         
+        # --- 3. ANEXO DE FOTOS (CUADRÍCULA 2x2) ---
         story.append(PageBreak())
         story.append(Paragraph("<b>Anexo de Comprobantes</b>", styles['Heading2']))
         cajas_fotos = []
         for g in gastos:
             if g[4] and os.path.exists(g[4]):
-                try: cajas_fotos.append([RLImage(g[4], width=240, height=260), Paragraph(f"<b>[ID {g[0]}]</b> {g[2]} - ${g[1]:.2f}<br/>{g[3][:35]}", ParagraphStyle('Img', fontSize=8, alignment=1))])
+                try: 
+                    cajas_fotos.append([
+                        RLImage(g[4], width=240, height=260), 
+                        Paragraph(f"<b>[ID {g[0]}]</b> {g[2]} - ${g[1]:.2f}<br/>{g[3][:35]}", ParagraphStyle('Img', fontSize=8, alignment=1))
+                    ])
                 except: pass
 
         filas = [cajas_fotos[i:i+2] if len(cajas_fotos[i:i+2])==2 else [cajas_fotos[i], ""] for i in range(0, len(cajas_fotos), 2)]
@@ -372,7 +432,6 @@ if __name__ == '__main__':
     
     app.add_handler(CommandHandler("start", saludar_usuario))
     app.add_handler(CommandHandler("iniciar_viaje", iniciar_viaje))
-    # Filtro solo para "Hola", "Buenas", "Buen dia" para que no interfiera
     app.add_handler(MessageHandler(filters.Regex(r'(?i)^(hola|buenas|buen dia)'), saludar_usuario))
     
     app.add_handler(MessageHandler(filters.PHOTO, procesar_foto))
@@ -380,7 +439,7 @@ if __name__ == '__main__':
     # Filtro inteligente de texto
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_texto))
     
-    # Callbacks de los botones (Edición, Categorías, Borrar)
+    # Callbacks de los botones
     app.add_handler(CallbackQueryHandler(boton_categoria, pattern='^cat_'))
     app.add_handler(CallbackQueryHandler(callback_gestionar_lista, pattern='^gestionar_lista$'))
     app.add_handler(CallbackQueryHandler(callback_opciones_gasto, pattern='^opciones_'))
