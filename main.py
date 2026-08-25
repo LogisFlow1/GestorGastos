@@ -51,7 +51,7 @@ async def saludar_usuario(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown", reply_markup=menu_teclado()
         )
     else:
-        await update.message.reply_text("👋 ¡Hola! Para iniciar un viaje escribe:\n`/iniciar_viaje Destino`")
+        await update.message.reply_text("👋 ¡Hola! Para iniciar un viaje nuevo, **escribe el lugar de destino** aquí abajo (Ejemplo: Rosario).")
 
 async def iniciar_viaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -74,7 +74,6 @@ async def iniciar_viaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- PROCESAMIENTO DE FOTOS Y CATEGORÍAS ---
 async def procesar_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ¿Estábamos esperando que el usuario enviara una foto para editar un gasto?
     if 'esperando_foto' in context.user_data:
         gasto_id = context.user_data['esperando_foto']
         photo_file = await update.message.photo[-1].get_file()
@@ -90,10 +89,9 @@ async def procesar_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         del context.user_data['esperando_foto']
         return await update.message.reply_text(f"✅ ¡Listo! Foto actualizada para el gasto ID {gasto_id}.")
 
-    # --- FLUJO NORMAL DE NUEVO GASTO ---
     user_id = update.effective_user.id
     viaje = get_viaje_activo(user_id)
-    if not viaje: return await update.message.reply_text("⚠️ No tienes ningún viaje activo. Escribe `/iniciar_viaje Destino`.")
+    if not viaje: return await update.message.reply_text("⚠️ No tienes ningún viaje activo. Escribe el nombre del destino para iniciar uno.")
 
     caption = update.message.caption or ""
     partes = caption.split(',', 1)
@@ -144,7 +142,7 @@ async def boton_categoria(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     await query.edit_message_text(text=f"✅ Guardado como **{categoria}**.", parse_mode="Markdown")
 
-# --- EDICIÓN Y GESTIÓN CON BOTONES (NUEVO SISTEMA) ---
+# --- EDICIÓN Y GESTIÓN CON BOTONES ---
 async def accion_ver_gastos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     viaje = get_viaje_activo(update.effective_user.id)
     if not viaje: return await update.message.reply_text("⚠️ No tienes ningún viaje activo.")
@@ -229,12 +227,15 @@ async def callback_editmonto(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data['esperando_monto'] = gasto_id
     await query.edit_message_text(f"✏️ **Escribe en el chat el nuevo monto** para el gasto ID {gasto_id} (solo el número):", parse_mode="Markdown")
 
-# --- LECTURA DE TEXTO LIBRE (PARA EDITAR MONTOS) ---
+# --- LECTURA INTELIGENTE DE TEXTO ---
 async def procesar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text
+    
+    # 1. ¿Está esperando un nuevo monto?
     if 'esperando_monto' in context.user_data:
         gasto_id = context.user_data['esperando_monto']
         try:
-            nuevo_monto = float(update.message.text.replace('$', '').replace(',', '.').strip())
+            nuevo_monto = float(txt.replace('$', '').replace(',', '.').strip())
             conn = sqlite3.connect("gastos.db")
             cursor = conn.cursor()
             cursor.execute("UPDATE gastos SET monto = ? WHERE id = ?", (nuevo_monto, gasto_id))
@@ -244,11 +245,35 @@ async def procesar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ ¡Listo! Monto corregido a **${nuevo_monto:.2f}**.")
         except ValueError:
             await update.message.reply_text("❌ Formato incorrecto. Escribe solo el número (Ej: 2500):")
+        return
+
+    # 2. Reaccionar a botones fijos
+    if txt == "📊 Ver Gastos": return await accion_ver_gastos(update, context)
+    if txt == "🏁 Cerrar Viaje": return await accion_cerrar_viaje(update, context)
+
+    # 3. MODO INTUITIVO: Si escribe algo y NO tiene viaje, es el DESTINO.
+    user_id = update.effective_user.id
+    viaje = get_viaje_activo(user_id)
+    
+    if not viaje:
+        destino = txt
+        fecha = datetime.now().strftime("%Y-%m-%d %H:%M")
+        conn = sqlite3.connect("gastos.db")
+        cursor = conn.cursor()
+        cursor.execute("UPDATE viajes SET activo = 0 WHERE user_id = ?", (user_id,))
+        cursor.execute("INSERT INTO viajes (user_id, destino, fecha_inicio, activo) VALUES (?, ?, ?, 1)", (user_id, destino, fecha))
+        conn.commit()
+        conn.close()
+
+        await update.message.reply_text(
+            f"✈️ **Viaje a {destino} iniciado.**\n\n"
+            "A partir de ahora, manda las fotos de tus comprobantes.\n"
+            "En el texto de la foto solo pon: `Monto, Descripción`.\n\n"
+            "👇 _Usa los botones de abajo para navegar._", parse_mode="Markdown", reply_markup=menu_teclado()
+        )
     else:
-        # Respuestas comunes a botones del teclado
-        txt = update.message.text
-        if txt == "📊 Ver Gastos": await accion_ver_gastos(update, context)
-        elif txt == "🏁 Cerrar Viaje": await accion_cerrar_viaje(update, context)
+        # Si tiene un viaje activo y escribe texto sin mandar foto
+        await update.message.reply_text("💡 Para agregar un gasto, envíame la **FOTO** del ticket y escribe en el comentario `Monto, Descripción`.\nSi quieres ver el resumen, usa los botones inferiores.")
 
 # --- REPORTE FINAL ---
 async def accion_cerrar_viaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -290,7 +315,6 @@ async def accion_cerrar_viaje(update: Update, context: ContextTypes.DEFAULT_TYPE
     t.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,0), colors.HexColor("#1A365D")), ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke), ('ALIGN', (0,0), (-1,-1), 'LEFT'), ('GRID', (0,0), (-1,-1), 0.5, colors.grey)]))
     story.append(t)
     
-    # Fotos
     story.append(PageBreak())
     story.append(Paragraph("<b>Anexo de Comprobantes</b>", styles['Heading2']))
     cajas_fotos = []
@@ -327,9 +351,10 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.Regex(r'(?i)^(hola|buenas|buen dia|inicio)'), saludar_usuario))
     
     app.add_handler(MessageHandler(filters.PHOTO, procesar_foto))
+    
+    # ESTE ES EL NUEVO FILTRO PARA LEER CUALQUIER TEXTO
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_texto))
     
-    # Callbacks de botones
     app.add_handler(CallbackQueryHandler(boton_categoria, pattern='^cat_'))
     app.add_handler(CallbackQueryHandler(callback_gestionar_lista, pattern='^gestionar_lista$'))
     app.add_handler(CallbackQueryHandler(callback_opciones_gasto, pattern='^opciones_'))
