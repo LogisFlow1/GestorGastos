@@ -316,7 +316,7 @@ if __name__ == '__main__':
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     
     app.add_handler(CommandHandler("start", saludar_usuario))
-    app.add_handler(MessageHandler(filters.Regex(r'^(?i)(hola|buenas|buen dia|inicio)'), saludar_usuario))
+    app.add_handler(MessageHandler(filters.Regex(r'(?i)^(hola|buenas|buen dia|inicio)'), saludar_usuario))
     app.add_handler(CommandHandler("iniciar_viaje", iniciar_viaje))
     app.add_handler(CommandHandler("gastos", listar_gastos))
     app.add_handler(CommandHandler("eliminar", eliminar_gasto))
