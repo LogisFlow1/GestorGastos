@@ -13,7 +13,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 
-# Lectura de credenciales por Variables de Entorno (o valores por defecto si pruebas localmente)
+# Credenciales desde Variables de Entorno (o valores por defecto)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "TU_TELEGRAM_BOT_TOKEN_AQUI")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "TU_GEMINI_API_KEY_AQUI")
 
@@ -56,7 +56,33 @@ def get_viaje_activo(user_id):
     conn.close()
     return viaje
 
-# --- COMANDOS DEL BOT ---
+# --- SALUDO Y MENÚ PRINCIPAL ---
+
+async def saludar_usuario(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_name = update.effective_user.first_name
+    viaje = get_viaje_activo(user_id)
+
+    if viaje:
+        _, destino, fecha = viaje
+        mensaje = (
+            f"👋 ¡Hola, {user_name}!\n\n"
+            f"Tienes un viaje activo hacia: **{destino}** (Iniciado: {fecha}).\n\n"
+            "📸 **Sube una foto** de un ticket/factura para sumar un gasto.\n"
+            "📋 Escribe `/gastos` para ver el resumen actual.\n"
+            "🏁 Escribe `/finalizar_viaje` cuando termines para generar tu reporte en PDF."
+        )
+    else:
+        mensaje = (
+            f"👋 ¡Hola, {user_name}! Soy tu asistente de rendición de gastos.\n\n"
+            "Para comenzar un nuevo viaje, escribe:\n"
+            "`/iniciar_viaje <Destino>`\n\n"
+            "_Ejemplo: `/iniciar_viaje Rosario`_"
+        )
+
+    await update.message.reply_text(mensaje, parse_mode="Markdown")
+
+# --- FLUJO DEL VIAJE ---
 
 async def iniciar_viaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -74,18 +100,18 @@ async def iniciar_viaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✈️ **Viaje iniciado** a: *{destino}*\n\n"
         "Comienza a enviarme las fotos de los comprobantes con su texto o audio.\n\n"
-        "**Comandos disponibles:**\n"
+        "**Opciones disponibles durante el viaje:**\n"
         "• `/gastos` : Ver lista de gastos acumulados\n"
-        "• `/editar_monto <ID> <monto>` : Corregir monto\n"
-        "• `/eliminar <ID>` : Borrar un gasto\n"
-        "• `/finalizar_viaje` : Generar PDF con cuadrícula de comprobantes",
+        "• `/editar_monto <ID> <monto>` : Corregir monto erróneo\n"
+        "• `/eliminar <ID>` : Borrar un comprobante cargado\n"
+        "• `/finalizar_viaje` : Generar PDF final",
         parse_mode="Markdown"
     )
 
 async def listar_gastos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     viaje = get_viaje_activo(update.effective_user.id)
     if not viaje:
-        await update.message.reply_text("⚠️ No tienes ningún viaje activo. Inicia uno con `/iniciar_viaje <destino>`.")
+        await update.message.reply_text("⚠️ No tienes ningún viaje activo. Escribe `Hola` o `/iniciar_viaje <destino>`.")
         return
 
     viaje_id, destino, _ = viaje
@@ -116,7 +142,7 @@ async def eliminar_gasto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         gasto_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("El ID debe ser un número entero.")
+        await update.message.reply_text("El ID debe ser un número.")
         return
 
     conn = sqlite3.connect("gastos.db")
@@ -164,17 +190,16 @@ async def editar_monto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ No se encontró el gasto con ID `{gasto_id}`.")
     conn.close()
 
-# --- PROCESAMIENTO DE IMÁGENES Y GASTOS ---
+# --- PROCESAMIENTO DE COMPROBANTES ---
 
 async def procesar_gasto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     viaje = get_viaje_activo(user_id)
     if not viaje:
-        await update.message.reply_text("⚠️ No tienes ningún viaje activo. Inicia uno con `/iniciar_viaje <destino>`.")
+        await update.message.reply_text("⚠️ No tienes ningún viaje activo. Escribe `Hola` o inicia uno con `/iniciar_viaje <destino>`.")
         return
 
     viaje_id = viaje[0]
-
     caption = update.message.caption or ""
     es_reemplazo = False
     gasto_id_reemplazo = None
@@ -193,7 +218,6 @@ async def procesar_gasto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect("gastos.db")
     cursor = conn.cursor()
 
-    # Reemplazo de foto de un gasto existente
     if es_reemplazo:
         cursor.execute("SELECT foto_path FROM gastos WHERE id = ?", (gasto_id_reemplazo,))
         res = cursor.fetchone()
@@ -207,7 +231,6 @@ async def procesar_gasto(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"🖼️ Foto del gasto ID `{gasto_id_reemplazo}` actualizada.")
             return
 
-    # Extracción de datos con Gemini
     await update.message.reply_text("⏳ Analizando comprobante con IA...")
 
     prompt = f"""
@@ -348,7 +371,6 @@ async def finalizar_viaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     doc.build(story)
 
-    # Cierre de viaje
     cursor.execute("UPDATE viajes SET activo = 0 WHERE id = ?", (viaje_id,))
     conn.commit()
     conn.close()
@@ -361,11 +383,17 @@ async def finalizar_viaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
 if __name__ == '__main__':
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     
+    # Comandos y Saludos
+    app.add_handler(CommandHandler("start", saludar_usuario))
+    app.add_handler(MessageHandler(filters.Regex(r'^(?i)(hola|buenas|buen dia|buenas tardes|inicio)'), saludar_usuario))
+    
     app.add_handler(CommandHandler("iniciar_viaje", iniciar_viaje))
     app.add_handler(CommandHandler("gastos", listar_gastos))
     app.add_handler(CommandHandler("eliminar", eliminar_gasto))
     app.add_handler(CommandHandler("editar_monto", editar_monto))
     app.add_handler(CommandHandler("finalizar_viaje", finalizar_viaje))
+    
+    # Manejo de imágenes
     app.add_handler(MessageHandler(filters.PHOTO, procesar_gasto))
 
     print("Bot activo y escuchando eventos...")
