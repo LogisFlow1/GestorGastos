@@ -1,379 +1,372 @@
 import os
-import sys
-import re
-import logging
-import threading
-import asyncio
-import base64
-import requests
-from io import BytesIO
-from PIL import Image
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import sqlite3
+import json
+from datetime import datetime
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from google import genai
+from google.genai import types
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ConversationHandler,
-    filters,
-    ContextTypes
-)
-from weasyprint import HTML
+# ReportLab para la generación del PDF
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage, PageBreak
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
 
-# Configuración de Logs
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+# Lectura de credenciales por Variables de Entorno (o valores por defecto si pruebas localmente)
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "TU_TELEGRAM_BOT_TOKEN_AQUI")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "TU_GEMINI_API_KEY_AQUI")
 
-# --- ESTADOS DE LA CONVERSACIÓN ---
-TITULO_VIAJE, ESPERANDO_FOTO, EDITANDO_MONTO, INGRESANDO_DESCRIPCION = range(4)
+ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# --- SERVIDOR HTTP DUMMY PARA RENDER ---
-class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot de Gastos Activo")
-
-def run_dummy_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(('0.0.0.0', port), SimpleHTTPRequestHandler)
-    server.serve_forever()
-
-threading.Thread(target=run_dummy_server, daemon=True).start()
-
-# --- FUNCION EXTRAER MONTO CON API OCR (Con Timeouts) ---
-def extraer_monto_ocr(ruta_imagen):
-    try:
-        url = 'https://api.ocr.space/parse/image'
-        with open(ruta_imagen, 'rb') as f:
-            response = requests.post(
-                url,
-                files={'filename': f},
-                data={'apikey': 'helloworld', 'language': 'spa', 'isOverlayRequired': False},
-                timeout=15  # Evita que la llamada se cuelgue si la API demora
-            )
-        
-        result = response.json()
-        if not result.get('ParsedResults'):
-            return 0.0
-
-        texto_unido = result['ParsedResults'][0]['ParsedText']
-        print(f">>> TEXTO DETECTADO POR OCR: {texto_unido}", flush=True)
-
-        lineas = texto_unido.split('\r\n')
-
-        # 1. Palabras clave
-        for linea in lineas:
-            if any(palabra in linea.lower() for palabra in ['total', 'importe', 'monto', 'pagar', 'suma', '$']):
-                numeros = re.findall(r'\d+(?:[.,]\d+)?', linea)
-                if numeros:
-                    return float(numeros[-1].replace(',', '.'))
-
-        # 2. Patrón de decimales
-        montos = re.findall(r'\b\d+[.,]\d{2}\b', texto_unido)
-        if montos:
-            return float(montos[-1].replace(',', '.'))
-
-        # 3. Número más alto
-        todos_los_numeros = re.findall(r'\b\d+(?:[.,]\d+)?\b', texto_unido)
-        if todos_los_numeros:
-            numeros_limpios = [float(n.replace(',', '.')) for n in todos_los_numeros if len(n) > 1]
-            if numeros_limpios:
-                return max(numeros_limpios)
-
-    except Exception as e:
-        print(f"❌ Error o Timeout en llamada OCR: {e}", flush=True)
-
-    return 0.0
-
-# --- HANDLERS DEL BOT DE TELEGRAM ---
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['gastos'] = []
-    context.user_data['titulo_viaje'] = "Rendición de Gastos"
-    
-    await update.message.reply_text(
-        "🚀 **¡Nuevo viaje iniciado!**\n\nPor favor, escribe el **título o motivo del viaje** (ejemplo: *Viaje de Negocios Córdoba*):"
-    )
-    return TITULO_VIAJE
-
-async def recibir_titulo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['titulo_viaje'] = update.message.text
-    
-    await update.message.reply_text(
-        f"📋 Viaje registrado como: **{context.user_data['titulo_viaje']}**\n\n"
-        "Ahora, envíame la foto del **primer comprobante/ticket** para procesarlo."
-    )
-    return ESPERANDO_FOTO
-
-async def procesar_imagen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg_espera = await update.message.reply_text("🔍 Analizando comprobante...")
-    
-    ruta_local = f"ticket_temp_{update.message.chat_id}.jpg"
-    try:
-        foto = await update.message.photo[-1].get_file()
-        await foto.download_to_drive(ruta_local)
-
-        # Compresión ligera para cuidar la memoria RAM en Render
-        with Image.open(ruta_local) as img:
-            img = img.convert('RGB')
-            img.thumbnail((600, 600))  # Tamaño optimizado
-            buffered = BytesIO()
-            img.save(buffered, format="JPEG", quality=65)
-            img_b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
-
-        monto_detectado = extraer_monto_ocr(ruta_local)
-
-    except Exception as e:
-        print(f"❌ Error procesando la imagen: {e}", flush=True)
-        await update.message.reply_text("⚠️ Ocurrió un inconveniente procesando la imagen. Por favor, reenvíala o escribe `/start` para reiniciar.")
-        return ESPERANDO_FOTO
-    finally:
-        if os.path.exists(ruta_local):
-            os.remove(ruta_local)
-
-    context.user_data['monto_actual'] = monto_detectado
-    context.user_data['foto_actual_b64'] = img_b64
-
-    keyboard = [
-        [InlineKeyboardButton("✅ Confirmar monto", callback_data='confirmar_monto')],
-        [InlineKeyboardButton("✏️ Editar monto manualmente", callback_data='editar_monto')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(
-        f"✅ **Monto detectado:** `${monto_detectado:.2f}`\n\n"
-        "¿El valor detectado es correcto?",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-    return ESPERANDO_FOTO
-
-async def solicitar_edicion_monto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    await query.edit_message_text(
-        f"✏️ El monto detectado actualmente es `${context.user_data.get('monto_actual', 0.0):.2f}`.\n\n"
-        "Por favor, escribe el **nuevo monto correcto** (ejemplo: `1250.50`):",
-        parse_mode='Markdown'
-    )
-    return EDITANDO_MONTO
-
-async def guardar_monto_editado(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    texto_ingresado = update.message.text.replace(',', '.')
-    
-    try:
-        nuevo_monto = float(re.sub(r'[^\d.]', '', texto_ingresado))
-        context.user_data['monto_actual'] = nuevo_monto
-        
-        await update.message.reply_text(
-            f"👍 Monto fijado en: `${nuevo_monto:.2f}`\n\n"
-            "📝 Ahora, escribe una breve **descripción** de este gasto (ejemplo: *Cena de equipo*, *Estacionamiento*, *Combustible*):",
-            parse_mode='Markdown'
+# --- BASE DE DATOS LOCAL (SQLite) ---
+def init_db():
+    conn = sqlite3.connect("gastos.db")
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS viajes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            destino TEXT,
+            fecha_inicio TEXT,
+            activo INTEGER DEFAULT 1
         )
-        return INGRESANDO_DESCRIPCION
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS gastos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            viaje_id INTEGER,
+            monto REAL,
+            categoria TEXT,
+            descripcion TEXT,
+            foto_path TEXT,
+            fecha TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+def get_viaje_activo(user_id):
+    conn = sqlite3.connect("gastos.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, destino, fecha_inicio FROM viajes WHERE user_id = ? AND activo = 1", (user_id,))
+    viaje = cursor.fetchone()
+    conn.close()
+    return viaje
+
+# --- COMANDOS DEL BOT ---
+
+async def iniciar_viaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    destino = " ".join(context.args) if context.args else "Destino no especificado"
+    fecha = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    conn = sqlite3.connect("gastos.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE viajes SET activo = 0 WHERE user_id = ?", (user_id,))
+    cursor.execute("INSERT INTO viajes (user_id, destino, fecha_inicio, activo) VALUES (?, ?, ?, 1)",
+                   (user_id, destino, fecha))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        f"✈️ **Viaje iniciado** a: *{destino}*\n\n"
+        "Comienza a enviarme las fotos de los comprobantes con su texto o audio.\n\n"
+        "**Comandos disponibles:**\n"
+        "• `/gastos` : Ver lista de gastos acumulados\n"
+        "• `/editar_monto <ID> <monto>` : Corregir monto\n"
+        "• `/eliminar <ID>` : Borrar un gasto\n"
+        "• `/finalizar_viaje` : Generar PDF con cuadrícula de comprobantes",
+        parse_mode="Markdown"
+    )
+
+async def listar_gastos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    viaje = get_viaje_activo(update.effective_user.id)
+    if not viaje:
+        await update.message.reply_text("⚠️ No tienes ningún viaje activo. Inicia uno con `/iniciar_viaje <destino>`.")
+        return
+
+    viaje_id, destino, _ = viaje
+    conn = sqlite3.connect("gastos.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, monto, categoria, descripcion FROM gastos WHERE viaje_id = ?", (viaje_id,))
+    gastos = cursor.fetchall()
+    conn.close()
+
+    if not gastos:
+        await update.message.reply_text("No hay gastos registrados aún en este viaje.")
+        return
+
+    texto = f"📋 **Gastos registrados ({destino}):**\n\n"
+    total = 0.0
+    for g in gastos:
+        gid, monto, cat, desc = g
+        texto += f"🔹 `ID: {gid}` | **${monto:.2f}** | [{cat}] {desc}\n"
+        total += monto
+    texto += f"\n💰 **Total acumulado:** ${total:.2f}"
+    await update.message.reply_text(texto, parse_mode="Markdown")
+
+async def eliminar_gasto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Uso: `/eliminar <ID>`\n(Consulta los IDs con `/gastos`)")
+        return
+
+    try:
+        gasto_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("⚠️ Valor no válido. Por favor ingresa un número correcto (ejemplo: `1500.00`):")
-        return EDITANDO_MONTO
+        await update.message.reply_text("El ID debe ser un número entero.")
+        return
 
-async def confirmar_monto_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    monto = context.user_data.get('monto_actual', 0.0)
-    await query.edit_message_text(
-        f"✅ Monto confirmado: `${monto:.2f}`\n\n"
-        "📝 Ahora, escribe una breve **descripción** de este gasto (ejemplo: *Almuerzo*, *Taxi al aeropuerto*, *Hotel*):",
-        parse_mode='Markdown'
-    )
-    return INGRESANDO_DESCRIPCION
+    conn = sqlite3.connect("gastos.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT foto_path FROM gastos WHERE id = ?", (gasto_id,))
+    res = cursor.fetchone()
 
-async def recibir_descripcion(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    descripcion = update.message.text
-    context.user_data['descripcion_actual'] = descripcion
+    if not res:
+        await update.message.reply_text(f"❌ No se encontró ningún gasto con ID `{gasto_id}`.")
+        conn.close()
+        return
 
-    return await guardar_gasto_en_lista(update, context)
-
-async def guardar_gasto_en_lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if 'gastos' not in context.user_data:
-        context.user_data['gastos'] = []
-
-    monto = context.user_data.get('monto_actual', 0.0)
-    foto_b64 = context.user_data.get('foto_actual_b64', '')
-    descripcion = context.user_data.get('descripcion_actual', 'Gasto sin descripción')
-    
-    context.user_data['gastos'].append({
-        'monto': monto,
-        'descripcion': descripcion,
-        'foto_b64': foto_b64
-    })
-
-    total_acumulado = sum(g['monto'] for g in context.user_data['gastos'])
-
-    keyboard = [
-        [InlineKeyboardButton("➕ Cargar otro gasto", callback_data='cargar_otro')],
-        [InlineKeyboardButton("📄 Cerrar viaje y generar PDF", callback_data='cerrar_viaje')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    mensaje = (
-        f"📌 **Gasto guardado:** {descripcion}\n"
-        f"💰 **Monto:** ${monto:.2f}\n"
-        f"📊 **Total acumulado en {context.user_data.get('titulo_viaje', 'este viaje')}:** `${total_acumulado:.2f}`\n\n"
-        "¿Qué deseas hacer a continuación?"
-    )
-
-    await update.message.reply_text(mensaje, reply_markup=reply_markup, parse_mode='Markdown')
-    return ESPERANDO_FOTO
-
-async def manejar_navegacion_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == 'cargar_otro':
-        total_actual = sum(g['monto'] for g in context.user_data.get('gastos', []))
-        await query.edit_message_text(
-            f"📸 **Listo para el siguiente comprobante.**\n"
-            f"Llevas acumulado: `${total_actual:.2f}`\n\n"
-            "Envíame la foto del siguiente ticket.",
-            parse_mode='Markdown'
-        )
-        return ESPERANDO_FOTO
-
-    elif query.data == 'cerrar_viaje':
-        gastos = context.user_data.get('gastos', [])
-        titulo = context.user_data.get('titulo_viaje', 'Rendición de Gastos')
-        total = sum(g['monto'] for g in gastos)
-
-        await query.edit_message_text("⏳ Generando el reporte PDF...")
-
-        filas_tabla = "".join([
-            f"<tr>"
-            f"<td>Gasto #{i+1}</td>"
-            f"<td>{g['descripcion']}</td>"
-            f"<td style='text-align: right;'>${g['monto']:.2f}</td>"
-            f"</tr>"
-            for i, g in enumerate(gastos)
-        ])
-
-        galeria_fotos = "".join([
-            f"""
-            <div class="comprobante-box">
-                <h4>Comprobante #{i+1}: {g['descripcion']} - Monto: ${g['monto']:.2f}</h4>
-                <img src="data:image/jpeg;base64,{g['foto_b64']}" class="ticket-img"/>
-            </div>
-            """
-            for i, g in enumerate(gastos) if g['foto_b64']
-        ])
-
-        html_content = f"""
-        <html>
-        <head>
-            <style>
-                body {{ font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; padding: 20px; color: #333; }}
-                h1 {{ color: #1a237e; margin-bottom: 5px; }}
-                h3 {{ color: #555; margin-top: 0; margin-bottom: 25px; }}
-                table {{ width: 100%; border-collapse: collapse; margin-bottom: 30px; }}
-                th, td {{ padding: 12px 15px; border-bottom: 1px solid #ddd; text-align: left; }}
-                th {{ background-color: #f5f5f5; font-weight: bold; }}
-                .total-row {{ font-size: 18px; font-weight: bold; background-color: #e8f5e9; color: #2e7d32; }}
-                .page-break {{ page-break-before: always; }}
-                .comprobante-box {{ margin-bottom: 30px; text-align: center; border: 1px solid #ddd; padding: 10px; border-radius: 5px; }}
-                .ticket-img {{ max-width: 90%; max-height: 450px; height: auto; border-radius: 3px; }}
-            </style>
-        </head>
-        <body>
-            <h1>Reporte de Gastos</h1>
-            <h3>Viaje / Motivo: {titulo}</h3>
-            
-            <table>
-                <thead>
-                    <tr>
-                        <th>Item</th>
-                        <th>Descripción</th>
-                        <th style="text-align: right;">Monto</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {filas_tabla}
-                    <tr class="total-row">
-                        <td colspan="2">TOTAL GENERAL</td>
-                        <td style="text-align: right;">${total:.2f}</td>
-                    </tr>
-                </tbody>
-            </table>
-
-            <div class="page-break"></div>
-            <h2>Anexo: Comprobantes Adjuntos</h2>
-            <hr><br>
-            {galeria_fotos}
-        </body>
-        </html>
-        """
-
-        pdf_path = f"reporte_{query.message.chat_id}.pdf"
+    foto_path = res[0]
+    if foto_path and os.path.exists(foto_path):
         try:
-            HTML(string=html_content).write_pdf(pdf_path)
+            os.remove(foto_path)
+        except OSError:
+            pass
 
-            with open(pdf_path, 'rb') as pdf_file:
-                await context.bot.send_document(
-                    chat_id=query.message.chat_id,
-                    document=pdf_file,
-                    filename=f"Reporte_{titulo.replace(' ', '_')}.pdf",
-                    caption=f"📄 **Viaje Finalizado: {titulo}**\nTotal acumulado: **${total:.2f}**\n\nSi deseas iniciar otro viaje, envía `/start`.",
-                    parse_mode='Markdown'
-                )
-        except Exception as e:
-            print(f"❌ Error generando PDF: {e}", flush=True)
-            await query.message.reply_text("⚠️ Error al generar el archivo PDF. Intenta de nuevo con `/start`.")
-        finally:
-            if os.path.exists(pdf_path):
-                os.remove(pdf_path)
+    cursor.execute("DELETE FROM gastos WHERE id = ?", (gasto_id,))
+    conn.commit()
+    conn.close()
 
-        context.user_data.clear()
-        return ConversationHandler.END
+    await update.message.reply_text(f"🗑️ Gasto con ID `{gasto_id}` eliminado correctamente.")
 
-# --- INICIALIZACIÓN Y EVENT LOOP ---
-if __name__ == '__main__':
-    TOKEN = os.environ.get("TELEGRAM_TOKEN")
-    if not TOKEN:
-        print("❌ ERROR: No se encontró TELEGRAM_TOKEN", flush=True)
-        sys.exit(1)
+async def editar_monto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text("Uso: `/editar_monto <ID> <nuevo_monto>`\nEjemplo: `/editar_monto 2 4500.50`")
+        return
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    try:
+        gasto_id = int(context.args[0])
+        nuevo_monto = float(context.args[1].replace(',', '.'))
+    except ValueError:
+        await update.message.reply_text("Formato incorrecto. El ID debe ser un número entero y el monto un valor numérico.")
+        return
 
-    app = ApplicationBuilder().token(TOKEN).build()
+    conn = sqlite3.connect("gastos.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE gastos SET monto = ? WHERE id = ?", (nuevo_monto, gasto_id))
+    if cursor.rowcount > 0:
+        conn.commit()
+        await update.message.reply_text(f"✏️ Gasto ID `{gasto_id}` actualizado a: **${nuevo_monto:.2f}**")
+    else:
+        await update.message.reply_text(f"❌ No se encontró el gasto con ID `{gasto_id}`.")
+    conn.close()
 
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            TITULO_VIAJE: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_titulo)],
-            ESPERANDO_FOTO: [
-                MessageHandler(filters.PHOTO, procesar_imagen),
-                CallbackQueryHandler(solicitar_edicion_monto, pattern='^editar_monto$'),
-                CallbackQueryHandler(confirmar_monto_callback, pattern='^confirmar_monto$'),
-                CallbackQueryHandler(manejar_navegacion_botones, pattern='^(cargar_otro|cerrar_viaje)$')
-            ],
-            EDITANDO_MONTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, guardar_monto_editado)],
-            INGRESANDO_DESCRIPCION: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_descripcion)]
-        },
-        fallbacks=[CommandHandler("start", start)]
+# --- PROCESAMIENTO DE IMÁGENES Y GASTOS ---
+
+async def procesar_gasto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    viaje = get_viaje_activo(user_id)
+    if not viaje:
+        await update.message.reply_text("⚠️ No tienes ningún viaje activo. Inicia uno con `/iniciar_viaje <destino>`.")
+        return
+
+    viaje_id = viaje[0]
+
+    caption = update.message.caption or ""
+    es_reemplazo = False
+    gasto_id_reemplazo = None
+
+    if caption.startswith("/cambiar_foto"):
+        partes = caption.split()
+        if len(partes) > 1 and partes[1].isdigit():
+            es_reemplazo = True
+            gasto_id_reemplazo = int(partes[1])
+
+    photo_file = await update.message.photo[-1].get_file()
+    os.makedirs("comprobantes", exist_ok=True)
+    foto_path = f"comprobantes/{photo_file.file_id}.jpg"
+    await photo_file.download_to_drive(foto_path)
+
+    conn = sqlite3.connect("gastos.db")
+    cursor = conn.cursor()
+
+    # Reemplazo de foto de un gasto existente
+    if es_reemplazo:
+        cursor.execute("SELECT foto_path FROM gastos WHERE id = ?", (gasto_id_reemplazo,))
+        res = cursor.fetchone()
+        if res:
+            if res[0] and os.path.exists(res[0]):
+                try: os.remove(res[0])
+                except OSError: pass
+            cursor.execute("UPDATE gastos SET foto_path = ? WHERE id = ?", (foto_path, gasto_id_reemplazo))
+            conn.commit()
+            conn.close()
+            await update.message.reply_text(f"🖼️ Foto del gasto ID `{gasto_id_reemplazo}` actualizada.")
+            return
+
+    # Extracción de datos con Gemini
+    await update.message.reply_text("⏳ Analizando comprobante con IA...")
+
+    prompt = f"""
+    Analiza este comprobante o factura de compra. Nota o contexto del usuario: '{caption}'.
+    Extrae la información y responde ÚNICAMENTE en formato JSON plano:
+    {{
+        "monto": 0.0,
+        "categoria": "Comida|Transporte|Hospedaje|Varios",
+        "descripcion": "Breve descripción del comercio y consumo"
+    }}
+    """
+    try:
+        with open(foto_path, "rb") as f:
+            foto_bytes = f.read()
+
+        response = ai_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[
+                prompt,
+                types.Part.from_bytes(data=foto_bytes, mime_type="image/jpeg")
+            ]
+        )
+        
+        datos = json.loads(response.text.strip('```json').strip('```'))
+
+        cursor.execute(
+            "INSERT INTO gastos (viaje_id, monto, categoria, descripcion, foto_path, fecha) VALUES (?, ?, ?, ?, ?, ?)",
+            (viaje_id, datos['monto'], datos['categoria'], datos['descripcion'], foto_path, datetime.now().strftime("%Y-%m-%d %H:%M"))
+        )
+        nuevo_id = cursor.lastrowid
+        conn.commit()
+
+        await update.message.reply_text(
+            f"✅ **Gasto Guardado (ID: {nuevo_id})**\n"
+            f"💵 **Monto:** ${datos['monto']:.2f}\n"
+            f"🏷️ **Categoría:** {datos['categoria']}\n"
+            f"📝 **Detalle:** {datos['descripcion']}\n\n"
+            f"_¿Deseas corregir? Usa `/editar_monto {nuevo_id} <monto>` o `/eliminar {nuevo_id}`_",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error al procesar el comprobante: {e}")
+    finally:
+        conn.close()
+
+# --- REPORTE PDF CON CUADRÍCULA 2X2 ---
+
+async def finalizar_viaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    viaje = get_viaje_activo(user_id)
+
+    if not viaje:
+        await update.message.reply_text("No tienes ningún viaje activo para rendir.")
+        return
+
+    viaje_id, destino, fecha_inicio = viaje
+    conn = sqlite3.connect("gastos.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, monto, categoria, descripcion, foto_path, fecha FROM gastos WHERE viaje_id = ?", (viaje_id,))
+    gastos = cursor.fetchall()
+
+    if not gastos:
+        await update.message.reply_text("No registraste ningún gasto en este viaje.")
+        conn.close()
+        return
+
+    pdf_filename = f"Reporte_Viaje_{viaje_id}.pdf"
+    doc = SimpleDocTemplate(
+        pdf_filename,
+        pagesize=letter,
+        leftMargin=36,
+        rightMargin=36,
+        topMargin=36,
+        bottomMargin=36
     )
+    styles = getSampleStyleSheet()
+    story = []
 
-    app.add_handler(conv_handler)
+    # Portada / Tabla de gastos
+    story.append(Paragraph("<b>Reporte de Rendición de Gastos</b>", styles['Title']))
+    story.append(Paragraph(f"<b>Destino:</b> {destino} | <b>Fecha de Inicio:</b> {fecha_inicio}", styles['Normal']))
+    story.append(Spacer(1, 15))
 
-    print(">>> BOT EN MARCHA Y ESCUCHANDO MENSAJES <<<", flush=True)
+    tabla_data = [["ID", "Fecha", "Categoría", "Descripción", "Monto ($)"]]
+    total_monto = 0.0
+
+    for g in gastos:
+        gid, monto, cat, desc, foto, fecha = g
+        tabla_data.append([str(gid), fecha, cat, desc, f"${monto:.2f}"])
+        total_monto += monto
+
+    tabla_data.append(["", "", "", "<b>TOTAL:</b>", f"<b>${total_monto:.2f}</b>"])
+
+    t = Table(tabla_data, colWidths=[30, 80, 80, 240, 100])
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#1A365D")),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
+        ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+    ]))
+    story.append(t)
     
-    # Parámetros optimizados para evitar desconexiones en entornos Cloud
-    app.run_polling(
-        drop_pending_updates=True,
-        read_timeout=30,
-        write_timeout=30,
-        connect_timeout=30
+    # Anexo de Comprobantes (2x2 por página)
+    story.append(PageBreak())
+    story.append(Paragraph("<b>Anexo de Comprobantes</b>", styles['Heading2']))
+    story.append(Spacer(1, 10))
+
+    label_style = ParagraphStyle('ImgLabel', parent=styles['Normal'], fontSize=8, leading=10, alignment=1)
+
+    cajas_fotos = []
+    for g in gastos:
+        gid, monto, cat, desc, foto_path, _ = g
+        if foto_path and os.path.exists(foto_path):
+            try:
+                img_obj = RLImage(foto_path, width=240, height=260)
+                etiqueta = Paragraph(f"<b>[ID: {gid}]</b> {cat} - ${monto:.2f}<br/>{desc[:35]}", label_style)
+                cajas_fotos.append([img_obj, etiqueta])
+            except Exception:
+                pass
+
+    filas_grid = []
+    for i in range(0, len(cajas_fotos), 2):
+        par = cajas_fotos[i:i+2]
+        if len(par) == 1:
+            filas_grid.append([par[0], ""])
+        else:
+            filas_grid.append([par[0], par[1]])
+
+    if filas_grid:
+        grid_table = Table(filas_grid, colWidths=[270, 270])
+        grid_table.setStyle(TableStyle([
+            ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 10),
+        ]))
+        story.append(grid_table)
+
+    doc.build(story)
+
+    # Cierre de viaje
+    cursor.execute("UPDATE viajes SET activo = 0 WHERE id = ?", (viaje_id,))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_document(
+        document=open(pdf_filename, 'rb'),
+        caption=f"🧾 **Rendición de Gastos Finalizada**\n**Destino:** {destino}\n**Total:** ${total_monto:.2f}"
     )
+
+if __name__ == '__main__':
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    app.add_handler(CommandHandler("iniciar_viaje", iniciar_viaje))
+    app.add_handler(CommandHandler("gastos", listar_gastos))
+    app.add_handler(CommandHandler("eliminar", eliminar_gasto))
+    app.add_handler(CommandHandler("editar_monto", editar_monto))
+    app.add_handler(CommandHandler("finalizar_viaje", finalizar_viaje))
+    app.add_handler(MessageHandler(filters.PHOTO, procesar_gasto))
+
+    print("Bot activo y escuchando eventos...")
+    app.run_polling()
