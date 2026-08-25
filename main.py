@@ -14,7 +14,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 
-TELEGRAM_TOKEN = os.environ.get("8968265973:AAHmTlUnNZi6B0lqF1fVot8mT6JlQTYyP_I")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
 # --- BASE DE DATOS LOCAL ---
 def init_db():
